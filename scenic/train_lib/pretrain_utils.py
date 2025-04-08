@@ -1,4 +1,4 @@
-# Copyright 2022 The Scenic Authors.
+# Copyright 2024 The Scenic Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,50 +14,23 @@
 
 """Utility functions for using pretrained models."""
 
-import collections
+from collections import abc
 import os
 import re
-from typing import Any, Dict, Mapping, List, Optional, Union, Tuple
+from typing import Any, Dict, Mapping, List, Optional, Union
 
 from absl import logging
+from big_vision import utils
 import flax
 from flax.training import checkpoints
-import jax
 import numpy as np
 
 from scenic.train_lib import train_utils
 from tensorflow.io import gfile
 
 # JAX team is working on type annotation for pytree:
-# https://github.com/google/jax/issues/1555
+# https://github.com/jax-ml/jax/issues/1555
 PyTree = Union[Mapping[str, Mapping], Any]
-
-
-def get_params_and_model_state_dict(
-    restored_train_state: PyTree) -> Tuple[PyTree, Optional[PyTree]]:
-  """Restores the params and model state.
-
-  This function also applies the conversion needed for pre-Linen checkpoints.
-
-  Args:
-    restored_train_state: A dictionary that contains a check-pointed TrainState.
-
-  Returns:
-    A tuple of restored params and restored models state. Note that these are
-    not frozen, and need to be frozen before passing them to the optimizer.
-  """
-  restored_params = restored_train_state['optimizer']['target']
-  restored_model_state = restored_train_state.get('model_state')
-  if 'params' in restored_params:  # Backward compatibility.
-    restored_params = restored_params['params']
-    restored_params = dict(checkpoints.convert_pre_linen(restored_params))
-    if restored_model_state:
-      restored_model_state = checkpoints.convert_pre_linen(
-          flax.traverse_util.unflatten_dict({
-              tuple(k.split('/')[1:]): v
-              for k, v in restored_model_state.items()
-          }))
-  return restored_params, restored_model_state
 
 
 def _replace_dict(model: PyTree,
@@ -67,6 +40,8 @@ def _replace_dict(model: PyTree,
                   name_mapping: Optional[Mapping[str, str]] = None,
                   skip_regex: Optional[str] = None) -> PyTree:
   """Replaces values in model dictionary with restored ones from checkpoint."""
+  name_mapping = name_mapping or {}
+
   model = flax.core.unfreeze(model)  # pytype: disable=wrong-arg-types
   restored = flax.core.unfreeze(restored)  # pytype: disable=wrong-arg-types
 
@@ -94,8 +69,8 @@ def _replace_dict(model: PyTree,
     # pytype: enable=attribute-error
     m_key_str = '/'.join(m_key)
     if m_key not in model_flat:
-      logging.warning(
-          '%s in checkpoint doesn\'t exist in model. Skip.', m_key_str)
+      logging.warning('%s in checkpoint doesn\'t exist in model. Skip.',
+                      m_key_str)
       continue
     if skip_regex and re.findall(skip_regex, m_key_str):
       logging.info('Skip loading parameter %s.', m_key_str)
@@ -108,7 +83,7 @@ def _replace_dict(model: PyTree,
 
 def init_from_pretrain_state(
     train_state: train_utils.TrainState,
-    pretrain_state: Mapping[str, Any],
+    pretrain_state: Union[PyTree, train_utils.TrainState],
     ckpt_prefix_path: Optional[List[str]] = None,
     model_prefix_path: Optional[List[str]] = None,
     name_mapping: Optional[Mapping[str, str]] = None,
@@ -129,22 +104,15 @@ def init_from_pretrain_state(
     Updated train_state.
   """
   name_mapping = name_mapping or {}
-  (restored_params,
-   restored_model_state) = get_params_and_model_state_dict(pretrain_state)
-  model_params = train_state.optimizer.target
-  model_params = _replace_dict(model_params,
-                               restored_params,
-                               ckpt_prefix_path,
-                               model_prefix_path,
-                               name_mapping,
-                               skip_regex)
-  new_optimizer = train_state.optimizer.replace(
-      target=model_params)
-  train_state = train_state.replace(  # pytype: disable=attribute-error
-      optimizer=new_optimizer)
+  restored_params = pretrain_state['params']
+  restored_model_state = pretrain_state['model_state']
+  model_params = _replace_dict(train_state.params, restored_params,
+                               ckpt_prefix_path, model_prefix_path,
+                               name_mapping, skip_regex)
+  train_state = train_state.replace(params=model_params)
+  # TODO(scenic): Add support for optionally restoring optimizer state.
   if (restored_model_state is not None and
-      train_state.model_state is not None and
-      train_state.model_state):
+      train_state.model_state is not None and train_state.model_state):
     if model_prefix_path:
       # Insert model prefix after 'batch_stats'.
       model_prefix_path = ['batch_stats'] + model_prefix_path
@@ -198,162 +166,63 @@ def restore_pretrained_checkpoint(
   if restored_train_state is None:
     raise ValueError('No checkpoint for the pretrained model is found in: '
                      f'{checkpoint_path}')
-  (restored_params,
-   restored_model_state) = get_params_and_model_state_dict(restored_train_state)
-  restored_params = flax.core.freeze(restored_params)
-  restored_model_state = flax.core.freeze(restored_model_state)
-  if train_state:
-    new_train_state = train_state
-    new_optimizer = train_state.optimizer.replace(
-        # Inspect and compare the parameters of the model with the init-model.
-        target=inspect_params(
-            expected_params=train_state.optimizer.target,
-            restored_params=restored_params,
-            fail_if_extra=False,
-            fail_if_missing=False,
-            fail_if_shapes_mismatch=False))
+  if 'params' in restored_train_state:
+    # restored_train_state was trained using optax
+    restored_params = flax.core.freeze(restored_train_state['params'])
   else:
-    new_train_state = train_utils.TrainState()
-    new_optimizer = {'target': restored_params}
+    # restored_train_state was trained using flax.optim. Note that this does
+    # not convert the naming of pre-Linen checkpoints.
+    restored_params = restored_train_state['optimizer']['target']
+    if 'params' in restored_params:  # Backward compatibility.
+      restored_params = restored_params['params']
+      restored_params = dict(checkpoints.convert_pre_linen(restored_params))
+    restored_params = flax.core.freeze(restored_params)
 
-  new_train_state = new_train_state.replace(  # pytype: disable=attribute-error
-      optimizer=new_optimizer,
-      model_state=restored_model_state,
-      global_step=int(restored_train_state['global_step']),
-      rng=restored_train_state['rng'],
-      accum_train_time=restored_train_state.get('accum_train_time', 0))
+  restored_model_state = (
+      None if restored_train_state['model_state'] is None else
+      flax.core.freeze(restored_train_state['model_state'])
+  )
 
-  return new_train_state
-
-
-def convert_big_vision_to_scenic_checkpoint(
-    checkpoint_path: str,
-    train_state: Optional[train_utils.TrainState] = None,
-    convert_to_linen: bool = True) -> train_utils.TrainState:
-  """Converts a big_vision checkpoint to a scenic train state.
-
-  The model weights, global step and accumulated train time are extracted.
-  Optimizer state, such as the momentum, is not extracted.
-
-  Args:
-    checkpoint_path: Path to big_vision checkpoint.
-    train_state: A Scenic TrainState object.
-    convert_to_linen: Whether to convert to Linen format.
-
-  Returns:
-    restored_train_state: Scenic train state with model weights, global step
-      and accumulated training time.
-  """
-
-  def unflatten_dict(flattened: Dict[str, Any],
-                     separator: str = '/',
-                     leaf_idx: int = -1) -> Dict[str, Any]:
-    unflattened = {}
-    for k, v in flattened.items():
-      subtree = unflattened
-      if leaf_idx != 0:
-        path = k.split(separator)[:leaf_idx]
-      else:
-        path = k.split(separator)
-      for k2 in path[:-1]:
-        if k2 not in subtree:
-          subtree[k2] = {}
-        subtree = subtree[k2]
-      subtree[path[-1]] = v
-    return unflattened
-
-  logging.info('Loading big_vision checkpoint from %s', checkpoint_path)
-  checkpoint_data = np.load(gfile.GFile(checkpoint_path, 'rb'))
-  tree = unflatten_dict(checkpoint_data, separator='/', leaf_idx=0)
-
-  restored_params = tree['opt']['target']
-  if convert_to_linen:
-    restored_params = checkpoints.convert_pre_linen(restored_params)
-  restored_params = dict(restored_params)
-  if train_state:
-    restored_params = inspect_params(
-        expected_params=train_state.optimizer.target,
+  if not train_state:
+    train_state = train_utils.TrainState()
+    params = restored_params
+  else:
+    # Inspect and compare the parameters of the model with the init-model.
+    params = inspect_params(
+        expected_params=train_state.params,
         restored_params=restored_params,
         fail_if_extra=False,
         fail_if_missing=False,
         fail_if_shapes_mismatch=False)
-  else:
-    train_state = train_utils.TrainState()
-  # pytype: disable=wrong-arg-types
-  restored_train_state = train_state.replace(  # pytype: disable=attribute-error
-      global_step=int(tree['opt']['state']['step']),
-      optimizer={'target': restored_params},
-      accum_train_time=int(tree['extra']['accum_train_time']))
-  # pytype: enable=wrong-arg-types
-
-  return restored_train_state
+  train_state = train_state.replace(
+      # Inspect and compare the parameters of the model with the init-model.
+      params=params,
+      model_state=restored_model_state,
+      global_step=int(restored_train_state['global_step']),
+      rng=restored_train_state['rng'],
+      metadata=restored_train_state.get('metadata', None))
+  return train_state
 
 
-def convert_strict_big_vision_to_scenic_checkpoint(
-    checkpoint_path: str,
-    train_state: train_utils.TrainState) -> train_utils.TrainState:
-  """Converts a checkpoint saved by big_vision into a Scenic TrainState.
-
-  This assumes that all the variables in the checkpoint are in the scenic
-  train state optimizer.
-
-  Args:
-    checkpoint_path: Full path to a big_vision checkpoint file
-    train_state: A Scenic TrainState object.
-
-  Returns:
-    restored_train_state: Scenic TrainState object with the 'global step',
-      'optimizer' and 'accum_train_time' fields.
-  """
-
-  def load_big_vision_checkpoint(tree, path):
-    assert gfile.exists(path), 'Checkpoint {} does not exist'.format(path)
-    with gfile.GFile(path, 'rb') as f:
-      data = np.load(f, allow_pickle=False)
-      return tree.unflatten(tuple(data.values()))
-
-  checkpoint_tree = {
-      'opt': train_state.optimizer,
-      'extra': dict(accum_train_time=0.0)
-  }
-  _, checkpoint_tree = jax.tree_flatten(checkpoint_tree)
-  checkpoint = load_big_vision_checkpoint(checkpoint_tree, checkpoint_path)
-  logging.info('Loaded big_vision checkpoint from %s', checkpoint_path)
-
-  restored_params = checkpoint['opt'].target
-  restored_params = dict(checkpoints.convert_pre_linen(restored_params))
-
-  restored_params = inspect_params(
-      expected_params=train_state.optimizer.target,
-      restored_params=restored_params,
-      fail_if_extra=False,
-      fail_if_missing=False,
-      fail_if_shapes_mismatch=False)
-
-  # pytype: disable=wrong-arg-types
-  restored_train_state = train_state.replace(  # pytype: disable=attribute-error
-      global_step=int(checkpoint['opt'].state.step),
-      optimizer={'target': restored_params},
-      accum_train_time=int(checkpoint['extra']['accum_train_time']))
-  # pytype: enable=wrong-arg-types
-
-  return restored_train_state
-
-
+# pylint: disable=g-doc-args,g-doc-return-or-yield
 def inspect_params(*,
                    expected_params: PyTree,
                    restored_params: PyTree,
                    fail_if_extra: bool = True,
                    fail_if_missing: bool = True,
                    fail_if_shapes_mismatch: bool = False) -> PyTree:
-  """Inspects whether the params are consistent with the expected keys."""
+  """Inspects whether the params are consistent with the expected keys.
+
+  Based on
+  https://github.com/google-research/big_vision/blob/main/big_vision/model/common.py.
+  """
 
   def _flatten_params(d, parent_key='', sep='/'):
     """Flattens a dictionary, keeping empty leaves."""
     items = []
     for k, v in d.items():
       path = parent_key + sep + k if parent_key else k
-      if isinstance(v, collections.MutableMapping):
+      if isinstance(v, abc.MutableMapping):
         items.extend(_flatten_params(v, path, sep=sep).items())
       else:
         items.append((path, v))
@@ -408,3 +277,77 @@ def inspect_params(*,
         f'Restored params from checkpoint: {restored_flat.keys()}.\n'
         f'Expected params from code: {expected_flat.keys()}.')
   return restored_params
+# pylint: enable=g-doc-args,g-doc-return-or-yield
+
+
+def convert_big_vision_to_scenic_checkpoint(
+    checkpoint_path: str,
+    train_state: Optional[train_utils.TrainState] = None,
+    convert_to_linen: bool = True) -> train_utils.TrainState:
+  """Converts a big_vision checkpoint to a scenic train state.
+
+  The model weights, global step and accumulated train time are extracted.
+  Optimizer state, such as the momentum, is not extracted.
+
+  Args:
+    checkpoint_path: Path to big_vision checkpoint.
+    train_state: A Scenic TrainState object.
+    convert_to_linen: Whether to convert to Linen format.
+
+  Returns:
+    restored_train_state: Scenic train state with model weights, global step
+      and accumulated training time.
+  """
+
+  def unflatten_dict(flattened: Dict[str, Any],
+                     separator: str = '/',
+                     leaf_idx: int = -1) -> Dict[str, Any]:
+    unflattened = {}
+    for k, v in flattened.items():
+      subtree = unflattened
+      if leaf_idx != 0:
+        path = k.split(separator)[:leaf_idx]
+      else:
+        path = k.split(separator)
+      for k2 in path[:-1]:
+        if k2 not in subtree:
+          subtree[k2] = {}
+        subtree = subtree[k2]
+      subtree[path[-1]] = v
+    return unflattened
+
+  logging.info('Loading big_vision checkpoint from %s', checkpoint_path)
+  if '.bv' in checkpoint_path:
+    checkpoint_data = utils.load_checkpoint_ts(checkpoint_path)
+  else:
+    checkpoint_data = np.load(gfile.GFile(checkpoint_path, 'rb'))
+  tree = unflatten_dict(checkpoint_data, separator='/', leaf_idx=0)
+
+  restored_params = (
+      tree['opt']['target']
+      if 'target' in tree.get('opt', {})
+      else tree['params']
+  )
+  if convert_to_linen:
+    restored_params = checkpoints.convert_pre_linen(restored_params)
+  restored_params = dict(restored_params)
+  if train_state:
+    restored_params = inspect_params(
+        expected_params=train_state.params,
+        restored_params=restored_params,
+        fail_if_extra=False,
+        fail_if_missing=False,
+        fail_if_shapes_mismatch=False)
+  else:
+    train_state = train_utils.TrainState()
+
+  # pytype: disable=wrong-arg-types
+  restored_train_state = train_state.replace(  # pytype: disable=attribute-error
+      global_step=int(
+          tree['opt']['state']['step'] if 'state' in tree.get('opt', {}) else 0
+      ),
+      params=restored_params,
+  )
+  # pytype: enable=wrong-arg-types
+
+  return restored_train_state
