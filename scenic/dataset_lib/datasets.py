@@ -56,6 +56,8 @@ _IMPORT_TABLE = {
         'scenic.projects.baselines.bert.datasets.bert_glue_dataset',
     'coco_detr_detection':
         'scenic.projects.baselines.detr.input_pipeline_detection',
+    'audiovisual_tfrecord_dataset':
+        'scenic.projects.mbt.datasets.audiovisual_tfrecord_dataset',
 }
 
 
