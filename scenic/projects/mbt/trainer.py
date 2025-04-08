@@ -10,7 +10,6 @@ from clu import periodic_actions
 from flax import jax_utils
 import flax.linen as nn
 import jax
-from jax.experimental.optimizers import clip_grads
 import jax.numpy as jnp
 import jax.profiler
 import ml_collections
@@ -28,6 +27,16 @@ Batch = Dict[str, jnp.ndarray]
 MetricFn = Callable[[jnp.ndarray, Dict[str, jnp.ndarray]],
                     Dict[str, Tuple[float, int]]]
 LossFn = Callable[[jnp.ndarray, Batch, Optional[jnp.ndarray]], float]
+
+
+def clip_grads(grads, max_norm):
+    """Clip gradients to max_norm."""
+    g_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_leaves(grads)))
+    g_norm = jnp.maximum(g_norm, 1e-6)
+    trigger = g_norm > max_norm
+    grads = jax.tree_map(
+        lambda x: jnp.where(trigger, x * (max_norm / g_norm), x), grads)
+    return grads
 
 
 def mixup_modalities(batch: Dict['str', Any],
