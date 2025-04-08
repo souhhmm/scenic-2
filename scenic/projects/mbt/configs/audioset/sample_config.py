@@ -3,6 +3,7 @@ import ml_collections
 def get_config():
     config = ml_collections.ConfigDict()
     
+    config.dataset_name = 'sample_dataset'
     # Dataset configuration
     config.dataset_configs = ml_collections.ConfigDict()
     config.dataset_configs.base_dir = 'scenic/projects/mbt/sample_tfrecords'  # Directory containing your TFRecords
@@ -63,7 +64,5 @@ def get_config():
     config.init_from.restore_positional_embedding = True
     config.init_from.restore_input_embedding = True
     config.init_from.positional_embed_size_change = 'resize_tile'
-    
-    config.dataset_name = 'sample_dataset'
     
     return config
