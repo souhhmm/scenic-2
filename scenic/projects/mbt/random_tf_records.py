@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow as tf
 import os
 from tqdm import tqdm
+import cv2
 
 def create_sample_tfrecords(output_dir, num_examples=100, num_shards=5):
     """Create sample TFRecords with random data for testing MBT."""
@@ -30,10 +31,14 @@ def create_sample_tfrecords(output_dir, num_examples=100, num_shards=5):
                 # Create SequenceExample
                 example = tf.train.SequenceExample()
                 
-                # Add video frames
+                # Add video frames as JPEG-encoded images
                 for frame in frames:
-                    frame_bytes = frame.tobytes()
-                    example.feature_lists.feature_list['image/encoded'].feature.add().bytes_list.value.append(frame_bytes)
+                    # Convert float32 [0,1] to uint8 [0,255]
+                    frame_uint8 = (frame * 255).astype(np.uint8)
+                    # Encode as JPEG
+                    _, jpeg_bytes = cv2.imencode('.jpg', frame_uint8)
+                    # Add to sequence
+                    example.feature_lists.feature_list['image/encoded'].feature.add().bytes_list.value.append(jpeg_bytes.tobytes())
                 
                 # Add audio spectrogram as a single feature with all values
                 feature = example.feature_lists.feature_list['melspec/feature/floats'].feature.add()
