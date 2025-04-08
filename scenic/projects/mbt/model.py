@@ -452,6 +452,9 @@ class MBT(nn.Module):
         cls = jnp.tile(cls, [n, 1, 1])
         x[modality] = jnp.concatenate([cls, x[modality]], axis=1)
         bottleneck_dtype = x[modality].dtype
+      else:
+        n, temporal_dims[modality], c = x[modality].shape
+        bottleneck_dtype = x[modality].dtype
 
     bottleneck = None
     if self.use_bottleneck:

@@ -90,8 +90,14 @@ def get_config():
     config.trainer_name = 'mbt_trainer'
     
     # Additional training parameters
-    config.optimizer = 'momentum'
+    config.optimizer = 'sgd'
     config.optimizer_configs = ml_collections.ConfigDict()
+    config.optimizer_configs.momentum = 0.9
+    config.optimizer_configs.nesterov = True
+    config.optimizer_configs.weight_decay = 0.0  # Move weight decay to optimizer config
+    config.optimizer_configs.grad_clip = ml_collections.ConfigDict()
+    config.optimizer_configs.grad_clip.clip_method = 'clip_by_global_norm'
+    config.optimizer_configs.grad_clip.clip_value = 1.0
     config.l2_decay_factor = 0
     config.max_grad_norm = 1
     config.label_smoothing = 0.3

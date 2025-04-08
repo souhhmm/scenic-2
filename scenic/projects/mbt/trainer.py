@@ -209,7 +209,7 @@ def train_step(
   lr = learning_rate_fn(step)
   (train_cost,
    (new_model_state,
-    logits)), grad = compute_gradient_fn(train_state.optimizer.target)
+    logits)), grad = compute_gradient_fn(train_state.params)
 
   if config.get('max_grad_norm', None) is not None:
     grad = clip_grads(grad, config.max_grad_norm)
@@ -217,7 +217,7 @@ def train_step(
   del train_cost
   # Re-use same axis_name as in the call to `pmap(...train_step...)` below.
   grad = jax.lax.pmean(grad, axis_name='batch')
-  new_optimizer = train_state.optimizer.apply_gradient(grad, learning_rate=lr)
+  new_optimizer = train_state.tx.update(grad, train_state.params, lr)
 
   # Explicit weight decay, if necessary.
   if config.get('explicit_weight_decay', None) is not None:
@@ -239,7 +239,8 @@ def train_step(
     metrics = metrics_fn(logits, batch)
   new_train_state = train_state.replace(  # pytype: disable=attribute-error
       global_step=step + 1,
-      optimizer=new_optimizer,
+      opt_state=new_optimizer,
+      params=new_optimizer.target,
       model_state=new_model_state,
       rng=new_rng)
   return new_train_state, metrics, lr
@@ -287,7 +288,7 @@ def eval_step(
     Calculated metrics [and optionally logits].
   """
   variables = {
-      'params': train_state.optimizer.target,
+      'params': train_state.params,
       **train_state.model_state
   }
   logits = flax_model.apply(
@@ -352,7 +353,7 @@ def test_step(
       'Spatial padding is not supported in multi-crop evaluation.')
 
   variables = {
-      'params': train_state.optimizer.target,
+      'params': train_state.params,
       **train_state.model_state
   }
   for modality in batch['inputs']:
@@ -433,22 +434,33 @@ def train(
        rngs=init_rng)
 
   # Create optimizer.
-  # We jit this, such that the arrays that are created are created on the same
-  # device as the input is, in this case the CPU. Else they'd be on device[0].
-  optimizer = jax.jit(
-      optimizers.get_optimizer(config).create, backend='cpu')(
-          params)
+  lr_fn = lr_schedules.get_learning_rate_fn(config)
+  optimizer_config = optimizers.get_optax_optimizer_config(config)
+  # If the config is already an optax-compatible config, better call directly:
+  #   optimizers.get_optimizer(config.optimizer_configs, lr_fn)
+  tx = optimizers.get_optimizer(optimizer_config, lr_fn, params=params)
+  # We jit this, such that the arrays that are created on the same device as the
+  # input is, in this case the CPU. Else they'd be on device[0].
+  opt_state = jax.jit(tx.init, backend='cpu')(params)
+
   rng, train_rng = jax.random.split(rng)
+  # Create chrono class to track and store training statistics and metadata:
+  chrono = train_utils.Chrono()
+
   train_state = train_utils.TrainState(
       global_step=0,
-      optimizer=optimizer,
+      opt_state=opt_state,
+      tx=tx,
+      params=params,
       model_state=model_state,
       rng=train_rng,
-      accum_train_time=0)
+      metadata={'chrono': chrono.save()})
+
   start_step = train_state.global_step
   if config.checkpoint:
-    train_state, start_step = train_utils.restore_checkpoint(
-        workdir, train_state)
+    train_state, start_step = train_utils.restore_checkpoint(workdir, train_state)
+  chrono.load(train_state.metadata['chrono'])
+  del train_state.metadata['chrono']
 
   if (start_step == 0  # Which means "no" checkpoint is restored!
       and config.get('init_from') is not None):
@@ -655,15 +667,17 @@ def train(
         writer.flush()
         del eval_metrics
     ##################### CHECKPOINTING ###########################
-    if ((step % checkpoint_steps == 0 and step > 0) or (step == total_steps) or
-        (step % log_eval_steps == 1)) and config.checkpoint:
+    if ((step % checkpoint_steps == 1 and step > 0) or (step == total_steps)) and config.checkpoint:
+      chrono.pause(wait_for=(train_state.params))
       with report_progress.timed('checkpoint'):
         # Sync model state across replicas.
         train_state = train_utils.sync_model_state_across_replicas(train_state)
         if lead_host:
-          train_state.replace(  # pytype: disable=attribute-error
-              accum_train_time=chrono.accum_train_time)
+          # Update chrono in the metadata before saving
+          train_state = train_state.replace(metadata={'chrono': chrono.save()})
           train_utils.save_checkpoint(workdir, train_state)
+          # Remove chrono from metadata after saving
+          train_state = train_state.replace(metadata={})
 
     ############# MULTICROP TESTING ############################
     if (config.dataset_configs.get('do_multicrop_test') and

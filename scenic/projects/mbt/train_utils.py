@@ -36,21 +36,25 @@ def compute_flops(flax_model_apply_fn: Callable[[jnp.ndarray], Any],
   Returns:
     flops: The total number of flops.
   """
-  input_placeholder = {}
-  for modality, spec in input_spec.items():
-    in_st = debug_utils.input_spec_to_jax_shape_dtype_struct(spec, batch_size=1)
-    input_placeholder[modality] = jnp.zeros(in_st.shape, in_st.dtype)
+  try:
+    input_placeholder = {}
+    for modality, spec in input_spec.items():
+      in_st = debug_utils.input_spec_to_jax_shape_dtype_struct(spec, batch_size=1)
+      input_placeholder[modality] = jnp.zeros(in_st.shape, in_st.dtype)
 
-  m = jax.xla_computation(flax_model_apply_fn)(
-      input_placeholder).as_hlo_module()
-  client = jax.lib.xla_bridge.get_backend()
-  analysis = jax.lib.xla_client._xla.hlo_module_cost_analysis(client, m)  # pylint: disable=protected-access
+    m = jax.xla_computation(flax_model_apply_fn)(
+        input_placeholder).as_hlo_module()
+    client = jax.lib.xla_bridge.get_backend()
+    analysis = jax.lib.xla_client._xla.hlo_module_cost_analysis(client, m)  # pylint: disable=protected-access
 
-  flops = analysis['flops']
-  if fuse_multiply_add:
-    flops = flops / 2
-  logging.info('GFLOPs %0.3f for input spec: %s', flops / 10**9, input_spec)
-  return flops
+    flops = analysis['flops']
+    if fuse_multiply_add:
+      flops = flops / 2
+    logging.info('GFLOPs %0.3f for input spec: %s', flops / 10**9, input_spec)
+    return flops
+  except Exception as e:
+    logging.warning('Failed to compute FLOPs: %s', str(e))
+    return 0.0  # Return 0 if FLOPs computation fails
 
 
 def initialize_model(
@@ -90,8 +94,9 @@ def initialize_model(
   @functools.partial(jax.jit, backend='cpu')
   def _initialize_model(rngs):
     """Initialization function to be jitted."""
-    init_model_state, init_params = model_def.init(
-        rngs, input_placeholder, train=False, debug=False).pop('params')
+    init_vars = model_def.init(rngs, input_placeholder, train=False, debug=False)
+    init_params = init_vars['params']
+    init_model_state = {k: v for k, v in init_vars.items() if k != 'params'}
     # Set bias in the head to low value, such that loss is small initially.
     if config.get('init_head_bias', None) is not None:
       init_params = flax.core.unfreeze(init_params)
