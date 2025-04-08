@@ -8,10 +8,14 @@ def get_config():
     config.dataset_configs = ml_collections.ConfigDict()
     config.dataset_configs.base_dir = 'scenic/projects/mbt/sample_tfrecords'  # Directory containing your TFRecords
     config.dataset_configs.tables = {
-        'train': 'train@5'  # Using 5 shards
+        'train': 'train@5',
+        'validation': 'train@5',  # Using 5 shards
+        'test': 'train@5'
     }
     config.dataset_configs.examples_per_subset = {
-        'train': 100  # Total number of examples    
+        'train': 100,  # Total number of examples 
+        'validation': 100,
+        'test': 100
     }
     config.dataset_configs.num_classes = 60
     config.data_dtype_str = 'float32'
