@@ -33,7 +33,7 @@ def create_sample_tfrecords(output_dir, num_examples=100, num_shards=5):
                 # Add video frames
                 for frame in frames:
                     frame_bytes = frame.tobytes()
-                    example.feature_lists.feature_list['rgb'].feature.add().bytes_list.value.append(frame_bytes)
+                    example.feature_lists.feature_list['image/encoded'].feature.add().bytes_list.value.append(frame_bytes)
                 
                 # Add audio spectrogram as float32 values
                 for row in spectrogram:
