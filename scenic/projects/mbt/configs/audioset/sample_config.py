@@ -19,6 +19,7 @@ def get_config():
     }
     config.dataset_configs.num_classes = 60
     config.data_dtype_str = 'float32'
+    
     # Add these required fields
     config.dataset_configs.modalities = ('rgb', 'spectrogram')
     config.dataset_configs.return_as_dict = True
@@ -31,6 +32,36 @@ def get_config():
     config.dataset_configs.spec_shape = (100, 128)
     config.dataset_configs.one_hot_labels = True
     config.dataset_configs.zero_centering = True
+    
+    # Multicrop eval settings
+    config.dataset_configs.do_multicrop_test = True
+    config.dataset_configs.log_test_epochs = 4
+    config.dataset_configs.num_test_clips = 4
+    config.dataset_configs.test_batch_size = 8  # Needs to be num_local_devices
+    config.multicrop_clips_per_device = 2
+    
+    # Augmentation parameters
+    config.dataset_configs.augmentation_params = ml_collections.ConfigDict()
+    config.dataset_configs.augmentation_params.do_jitter_scale = True
+    config.dataset_configs.augmentation_params.scale_min_factor = 0.9
+    config.dataset_configs.augmentation_params.scale_max_factor = 1.33
+    config.dataset_configs.augmentation_params.prob_scale_jitter = 1.0
+    config.dataset_configs.augmentation_params.do_color_augment = True
+    config.dataset_configs.augmentation_params.prob_color_augment = 0.8
+    config.dataset_configs.augmentation_params.prob_color_drop = 0.1
+    
+    config.dataset_configs.prefetch_to_device = 2
+    
+    # SpecAugment hyperparameters
+    config.dataset_configs.spec_augment = True
+    config.dataset_configs.spec_augment_params = ml_collections.ConfigDict()
+    config.dataset_configs.spec_augment_params.freq_mask_max_bins = 48
+    config.dataset_configs.spec_augment_params.freq_mask_count = 1
+    config.dataset_configs.spec_augment_params.time_mask_max_frames = 48
+    config.dataset_configs.spec_augment_params.time_mask_count = 4
+    config.dataset_configs.spec_augment_params.time_warp_max_frames = 1.0
+    config.dataset_configs.spec_augment_params.time_warp_max_ratio = 0
+    config.dataset_configs.spec_augment_params.time_mask_max_ratio = 0
     
     # Model configuration
     config.model_name = 'mbt_classification'
@@ -56,7 +87,23 @@ def get_config():
     config.batch_size = 32
     config.eval_batch_size = 32
     config.rng_seed = 0
-    config.trainer_name = 'mbt_trainer'  # Add this
+    config.trainer_name = 'mbt_trainer'
+    
+    # Additional training parameters
+    config.optimizer = 'momentum'
+    config.optimizer_configs = ml_collections.ConfigDict()
+    config.l2_decay_factor = 0
+    config.max_grad_norm = 1
+    config.label_smoothing = 0.3
+    config.num_training_epochs = 50
+    
+    # Mixup configuration
+    config.mixup = ml_collections.ConfigDict()
+    config.mixup.alpha = 0.5
+    config.mixmod = False
+    
+    # Additional regularization
+    config.model.stochastic_droplayer_rate = 0.3
 
     # ImageNet checkpoint configuration
     config.init_from = ml_collections.ConfigDict()
