@@ -14,7 +14,7 @@ def get_config():
         'train': 100  # Total number of examples    
     }
     config.dataset_configs.num_classes = 60
-    
+    config.data_dtype_str = 'float32'
     # Add these required fields
     config.dataset_configs.modalities = ('rgb', 'spectrogram')
     config.dataset_configs.return_as_dict = True
