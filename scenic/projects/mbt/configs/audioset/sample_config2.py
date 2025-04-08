@@ -78,7 +78,7 @@ def get_config():
   config.dataset_configs.spec_augment_params.time_mask_max_ratio = 0
 
   # Model: MBT-base
-  config.model_name = 'mbt_multilabel_classification'
+  config.model_name = 'mbt_classification'
   config.model = ml_collections.ConfigDict()
   # Supports 'rgb' and 'spectrogram'
   config.model.modality_fusion = ('spectrogram', 'rgb')
@@ -136,7 +136,7 @@ def get_config():
   # Download pretrained ImageNet checkpoints from here:
   # https://github.com/google-research/scenic/tree/main/scenic/projects/baselines (checkpoint_format = 'scenic')  pylint: disable=line-too-long
   # https://github.com/google-research/vision_transformer (checkpoint_format = 'big_vision')  pylint: disable=line-too-long
-  config.init_from.checkpoint_path = 'path_to_checkpoint_of_vit_b_16'
+  config.init_from.checkpoint_path = 'scenic/projects/mbt/ViT_B_16_ImageNet21k'
   config.init_from.checkpoint_format = 'scenic'
   config.init_from.model_config = ml_collections.ConfigDict()
   config.init_from.model_config.model = ml_collections.ConfigDict()
