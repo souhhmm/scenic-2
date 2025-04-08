@@ -1,0 +1,6 @@
+scenic/projects/mbt/ViT_B_16_ImageNet21k
+*.ckpt
+*.h5
+*.pth
+*.pt
+*.bin
