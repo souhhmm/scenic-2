@@ -35,9 +35,9 @@ def create_sample_tfrecords(output_dir, num_examples=100, num_shards=5):
                     frame_bytes = frame.tobytes()
                     example.feature_lists.feature_list['rgb'].feature.add().bytes_list.value.append(frame_bytes)
                 
-                # Add audio spectrogram
-                spec_bytes = spectrogram.tobytes()
-                example.feature_lists.feature_list['melspec/feature/floats'].feature.add().bytes_list.value.append(spec_bytes)
+                # Add audio spectrogram as float32 values
+                for row in spectrogram:
+                    example.feature_lists.feature_list['melspec/feature/floats'].feature.add().float_list.value.extend(row)
                 
                 # Add label
                 example.context.feature['label'].int64_list.value.append(label)
