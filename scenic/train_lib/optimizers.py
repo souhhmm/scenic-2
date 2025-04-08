@@ -22,7 +22,7 @@ import dataclasses
 from typing import Any, Callable, Generator, List, Tuple
 
 import flax
-from flax import optim as optimizers
+import optax
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -33,46 +33,21 @@ import numpy as np
 PyTree = Any
 
 
-def get_optimizer(config: ml_collections.ConfigDict) -> optimizers.OptimizerDef:
-  """Constructs  the optimizer from the given HParams.
-
-  Args:
-    config: Configurations of the optimizer.
-
-  Returns:
-    A flax optimizer.
-  """
-  if config.optimizer == 'sgd':
-    return optimizers.GradientDescent(
-        learning_rate=config.lr_configs['base_learning_rate'])
-  if config.optimizer == 'nesterov':
-    return optimizers.Momentum(
-        learning_rate=config.lr_configs['base_learning_rate'],
-        beta=config.optimizer_configs.get('momentum', 0.9),
-        weight_decay=config.optimizer_configs.get('weight_decay', 0.0),
-        nesterov=True)
-  if config.optimizer == 'momentum':
-    return optimizers.Momentum(
-        learning_rate=config.lr_configs['base_learning_rate'],
-        beta=config.optimizer_configs.get('momentum', 0.9),
-        weight_decay=config.optimizer_configs.get('weight_decay', 0.0),
-        nesterov=False)
-  if config.optimizer == 'momentum_hp':
-    return MomentumHP(
-        learning_rate=config.lr_configs['base_learning_rate'],
-        beta=config.optimizer_configs.get('momentum', 0.9))
-  if config.optimizer == 'adam':
-    return optimizers.Adam(
-        learning_rate=config.lr_configs['base_learning_rate'],
-        beta1=config.optimizer_configs.get('beta1', 0.9),
-        beta2=config.optimizer_configs.get('beta2', 0.999),
-        eps=config.optimizer_configs.get('epsilon', 1e-8),
-        weight_decay=config.optimizer_configs.get('weight_decay', 0.0),
-    )
-
-  else:
-    raise NotImplementedError('Optimizer {} not implemented'.format(
-        config.optimizer))
+def get_optimizer(config: ml_collections.ConfigDict) -> optax.GradientTransformation:
+    """Returns an optax optimizer based on the config."""
+    if config.optimizer == 'momentum':
+        return optax.sgd(
+            learning_rate=config.lr_configs.base_learning_rate,
+            momentum=config.optimizer_configs.get('momentum', 0.9),
+            nesterov=config.optimizer_configs.get('nesterov', False))
+    elif config.optimizer == 'adam':
+        return optax.adam(
+            learning_rate=config.lr_configs.base_learning_rate,
+            b1=config.optimizer_configs.get('beta1', 0.9),
+            b2=config.optimizer_configs.get('beta2', 0.999),
+            eps=config.optimizer_configs.get('epsilon', 1e-8))
+    else:
+        raise ValueError(f'Unknown optimizer: {config.optimizer}')
 
 
 class MomentumHP(flax.optim.OptimizerDef):
