@@ -100,13 +100,13 @@ def initialise_from_train_state(
     init_config, model_config, dataset_config = config
 
   # Inspect and compare the parameters of the model with the init-model
-  params = flax.core.unfreeze(train_state.optimizer.target)
+  params = flax.core.unfreeze(train_state.params)
   logging.info('Parameters in the target model are: %s', params)
 
   if init_config.get('checkpoint_format', 'scenic') == 'big_vision':
-    restored_params = restored_train_state.optimizer['target']
+    restored_params = restored_train_state.params
   else:
-    restored_params = restored_train_state.optimizer.target
+    restored_params = restored_train_state.params
   restored_params = flax.core.unfreeze(restored_params)
   if init_config.get('init_from_vit', True):
     if prefix_path:
@@ -173,9 +173,9 @@ def initialise_from_train_state(
         init_embedding(video_params, m_params, init_config, model_config,
                        'embedding_spectrogram')
       else:
-        if m_key in train_state.optimizer.target:
+        if m_key in train_state.params:
           video_params[m_key] = m_params
-        if '%s_spectrogram' % m_key in train_state.optimizer.target:
+        if '%s_spectrogram' % m_key in train_state.params:
           video_params['%s_spectrogram' % m_key] = m_params
         else:
           logging.info('Skipping %s. In restored model but not in target',
@@ -198,7 +198,7 @@ def initialise_from_train_state(
           assert restored_model_cfg.model.representation_size
           params[m_key] = m_params
       else:
-        if m_key in train_state.optimizer.target:
+        if m_key in train_state.params:
           params[m_key] = m_params
         else:
           logging.info('Skipping %s. In restored model but not in target',
@@ -207,8 +207,7 @@ def initialise_from_train_state(
   if log_initialised_param_shapes:
     logging.info('Parameter summary after initialising from train state')
     debug_utils.log_param_shapes(params)
-  return train_state.replace(
-      optimizer=train_state.optimizer.replace(target=flax.core.freeze(params)))
+  return train_state.replace(params=flax.core.freeze(params))
 
 
 def init_posemb(to_params, from_params, init_config, model_config,

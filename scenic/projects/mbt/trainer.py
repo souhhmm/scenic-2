@@ -501,6 +501,13 @@ def train(
   # Get learning rate scheduler.
   learning_rate_fn = lr_schedules.get_learning_rate_fn(config)
 
+  # Initialize chrono with the correct parameters
+  chrono.inform(
+      first_step=start_step,
+      total_steps=total_steps,
+      global_bs=config.batch_size,
+      steps_per_epoch=steps_per_epoch)
+
   train_step_pmapped = jax.pmap(
       functools.partial(
           train_step,
@@ -570,13 +577,6 @@ def train(
   train_metrics, extra_training_logs = [], []
   train_summary, eval_summary = None, None
 
-  chrono = train_utils.Chrono(
-      first_step=start_step,
-      total_steps=total_steps,
-      steps_per_epoch=steps_per_epoch,
-      global_bs=config.batch_size,
-      accum_train_time=int(jax_utils.unreplicate(train_state.accum_train_time)))
-
   logging.info('Starting training loop at step %d.', start_step + 1)
   report_progress = periodic_actions.ReportProgress(
       num_train_steps=total_steps, writer=writer)
@@ -591,7 +591,7 @@ def train(
     writer.write_scalars(1, step0_log)
 
   for step in range(start_step + 1, total_steps + 1):
-    with jax.profiler.StepTraceContext('train', step_num=step):
+    with jax.profiler.StepTraceAnnotation('train', step_num=step):
       train_batch = next(dataset.train_iter)
       train_state, t_metrics, lr = train_step_pmapped(train_state, train_batch)
       # This will accumulate metrics in TPU memory up to the point that we log
