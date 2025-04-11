@@ -7,8 +7,9 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 from absl import logging
 from clu import metric_writers
 from clu import periodic_actions
-from flax import jax_utils
+import flax
 import flax.linen as nn
+from flax import jax_utils
 import jax
 import jax.numpy as jnp
 import jax.profiler
@@ -21,6 +22,7 @@ from scenic.train_lib import lr_schedules
 from scenic.train_lib import optimizers
 from scenic.train_lib import pretrain_utils
 from scenic.train_lib import train_utils
+import optax
 
 # Aliases for custom types:
 Batch = Dict[str, jnp.ndarray]
@@ -127,7 +129,7 @@ def train_step(
     batch: Batch,
     *,
     flax_model: nn.Module,
-    learning_rate_fn: Callable[[int], float],
+    lr_fn: Callable[[int], float],
     loss_fn: LossFn,
     metrics_fn: MetricFn,
     config: ml_collections.ConfigDict,
@@ -143,29 +145,28 @@ def train_step(
 
   Args:
     train_state: The state of training including the current
-      global_step, model_state, rng, and optimizer. The buffer of this argument
-      can be donated to the computation.
-    batch: A single batch of data. The buffer of this argument can be donated to
-      the computation.
+      global_step, model_state, rng, and optimizer.
+    batch: A single batch of data.
     flax_model: A Flax model.
-    learning_rate_fn: learning rate scheduler which give the global_step
+    lr_fn: learning rate scheduler which give the global_step
       generates the learning rate.
     loss_fn: A loss function that given logits, a batch, and parameters of the
       model calculates the loss.
     metrics_fn: A metrics function that given logits and batch of data,
       calculates the metrics as well as the loss.
     config: Configuration of the experiment.
-    debug: Whether the debug mode is enabled during training. `debug=True`
-      enables model specific logging/storing some values using
-      jax.host_callback.
+    debug: Whether the debug mode is enabled during training.
 
   Returns:
     Updated state of training, computed metrics, and learning rate for logging.
   """
-  new_rng, rng = jax.random.split(train_state.rng)
+  # Get current learning rate
+  step = train_state.global_step
+  lr = lr_fn(step)
 
+  # Prepare data with mixup if needed
   if config.get('mixup') and config.mixup.alpha:
-    mixup_rng, rng = jax.random.split(rng, 2)
+    mixup_rng, rng = jax.random.split(train_state.rng, 2)
     mixup_rng = train_utils.bind_rng_to_host_device(
         mixup_rng,
         axis_name='batch',
@@ -187,10 +188,19 @@ def train_step(
     for modality in batch['inputs']:
       batch['label'][modality] = labels
     batch['label']['all'] = labels
+    rng = train_state.rng
 
-  # Bind the rng to the host/device we are on for dropout.
+  # Split RNG for different uses
+  dropout_rng, params_rng, rng = jax.random.split(rng, num=3)
   dropout_rng = train_utils.bind_rng_to_host_device(
-      rng, axis_name='batch', bind_to='device')
+      dropout_rng, axis_name='batch', bind_to='device')
+  params_rng = train_utils.bind_rng_to_host_device(
+      params_rng, axis_name='batch', bind_to='device')
+
+  rngs = {'dropout': dropout_rng, 'params': params_rng}
+
+  # Ensure params is a FrozenDict
+  params = flax.core.freeze(train_state.params)
 
   def training_loss_fn(params):
     variables = {'params': params, **train_state.model_state}
@@ -198,37 +208,39 @@ def train_step(
         variables,
         batch['inputs'],
         mutable=['batch_stats'],
+        rngs=rngs,
         train=True,
-        rngs={'dropout': dropout_rng},
         debug=debug)
     loss = loss_fn(logits, batch, variables['params'])
     return loss, (new_model_state, logits)
 
   compute_gradient_fn = jax.value_and_grad(training_loss_fn, has_aux=True)
-  step = train_state.global_step
-  lr = learning_rate_fn(step)
-  (train_cost,
-   (new_model_state,
-    logits)), grad = compute_gradient_fn(train_state.params)
+  (train_cost, (new_model_state, logits)), grad = compute_gradient_fn(params)
 
+  del train_cost
+
+  # Clip gradients if configured
   if config.get('max_grad_norm', None) is not None:
     grad = clip_grads(grad, config.max_grad_norm)
 
-  del train_cost
   # Re-use same axis_name as in the call to `pmap(...train_step...)` below.
   grad = jax.lax.pmean(grad, axis_name='batch')
-  new_optimizer = train_state.tx.update(grad, train_state.params, lr)
+
+  if train_state.tx is None:
+    raise ValueError('train_state.tx is None')
+
+  updates, new_opt_state = train_state.tx.update(grad, train_state.opt_state, params)
+  new_params = optax.apply_updates(params=params, updates=updates)
 
   # Explicit weight decay, if necessary.
   if config.get('explicit_weight_decay', None) is not None:
-    new_optimizer = new_optimizer.replace(
-        target=optimizers.tree_map_with_names(
-            functools.partial(
-                optimizers.decay_weight_fn,
-                lr=lr,
-                decay=config.explicit_weight_decay),
-            new_optimizer.target,
-            match_name_fn=lambda name: 'kernel' in name))
+    new_params = optimizers.tree_map_with_names(
+        functools.partial(
+            optimizers.decay_weight_fn,
+            lr=lr,
+            decay=config.explicit_weight_decay),
+        new_params,
+        match_name_fn=lambda name: 'kernel' in name)
 
   if isinstance(logits, dict):
     # We use the first retrieved logits to report training metrics.
@@ -236,13 +248,15 @@ def train_step(
     batch['label'] = batch['label'][modality]
     metrics = metrics_fn(logits[modality], batch)
   else:
-    metrics = metrics_fn(logits, batch)
+    metrics = metrics_fn(labels, batch) # logits, batch originally updated for debugging
+
   new_train_state = train_state.replace(  # pytype: disable=attribute-error
       global_step=step + 1,
-      opt_state=new_optimizer,
-      params=new_optimizer.target,
+      opt_state=new_opt_state,
+      params=new_params,
       model_state=new_model_state,
-      rng=new_rng)
+      rng=rng)
+
   return new_train_state, metrics, lr
 
 
@@ -416,7 +430,7 @@ def train(
   is_multilabel_model = (config.model_name == 'mbt_multilabel_classification')
 
   # Initialize model.
-  rng, init_rng = jax.random.split(rng)
+  rng, params_rng, dropout_rng = jax.random.split(rng, num=3)
   input_shapes = dataset.meta_data['input_shape']
   input_dtype = dataset.meta_data.get('input_dtype', jnp.float32)
   if isinstance(input_shapes, dict):
@@ -426,22 +440,27 @@ def train(
     }
   else:
     input_spec = [(input_shapes, input_dtype)]
+  
+  rngs = {'params': params_rng, 'dropout': dropout_rng}
   (params, model_state, num_trainable_params,
    gflops) = mbt_train_utils.initialize_model(
        model_def=model.flax_model,
        input_spec=input_spec,
        config=config,
-       rngs=init_rng)
+       rngs=rngs)
 
+  # Ensure params are FrozenDict
+  params = flax.core.freeze(params)
+  
   # Create optimizer.
   lr_fn = lr_schedules.get_learning_rate_fn(config)
   optimizer_config = optimizers.get_optax_optimizer_config(config)
-  # If the config is already an optax-compatible config, better call directly:
-  #   optimizers.get_optimizer(config.optimizer_configs, lr_fn)
-  tx = optimizers.get_optimizer(optimizer_config, lr_fn, params=params)
+  # Create optimizer - note the exact argument names
+  optimizer = optimizers.get_optimizer(
+      optimizer_config, learning_rate_fn=lr_fn, params=params)
   # We jit this, such that the arrays that are created on the same device as the
   # input is, in this case the CPU. Else they'd be on device[0].
-  opt_state = jax.jit(tx.init, backend='cpu')(params)
+  opt_state = jax.jit(optimizer.init, backend='cpu')(params)
 
   rng, train_rng = jax.random.split(rng)
   # Create chrono class to track and store training statistics and metadata:
@@ -450,7 +469,7 @@ def train(
   train_state = train_utils.TrainState(
       global_step=0,
       opt_state=opt_state,
-      tx=tx,
+      tx=optimizer,
       params=params,
       model_state=model_state,
       rng=train_rng,
@@ -512,7 +531,7 @@ def train(
       functools.partial(
           train_step,
           flax_model=model.flax_model,
-          learning_rate_fn=learning_rate_fn,
+          lr_fn=learning_rate_fn,
           loss_fn=model.loss_function,
           metrics_fn=model.get_metrics_fn('train'),
           config=config,

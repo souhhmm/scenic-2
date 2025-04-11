@@ -1,4 +1,4 @@
-# Copyright 2022 The Scenic Authors.
+# Copyright 2024 The Scenic Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 """Defines different learning_rate schedules."""
 
 import jax.numpy as jnp
+import ml_collections
 
 
 def polynomial_lr_scheduler(step, decay_steps, end_factor, power):
@@ -40,9 +41,9 @@ def polynomial_lr_scheduler(step, decay_steps, end_factor, power):
     Scaling factor applied to the learning rate on the given step.
   """
 
-  step = min(decay_steps, step)
-  decayed_learning_rate = (1 - end_factor) * (1 - step / decay_steps)**(
-      power) + end_factor
+  decay = step <= decay_steps
+  decayed_learning_rate = (1 - end_factor) * (
+      decay * (1 - step / decay_steps))**(power) + end_factor
   return decayed_learning_rate
 
 
@@ -85,17 +86,15 @@ def piecewise_linear_scheduler(step, decay_events, decay_factors):
   Returns:
     Scaling factor applied to the learning rate on the given step.
   """
-  boundaries = jnp.array([0] + decay_events)
-  factors = [1.0] + decay_factors
+  boundaries = jnp.array([0] + decay_events + [step])
+  factors = jnp.array([1.0] + decay_factors + [decay_factors[-1]])
   index = jnp.sum(boundaries[1:] < step)
-  if index + 1 == len(factors):
-    return jnp.take(factors, index)
-  else:
-    m = (jnp.take(factors, index + 1) - jnp.take(factors, index)) / (
-        jnp.take(boundaries, index + 1) - jnp.take(boundaries, index))
-    interpolated_factor = (
-        m * (step - jnp.take(boundaries, index)) + jnp.take(factors, index))
-    return interpolated_factor
+  m = jnp.take(factors, index + 1) - jnp.take(factors, index)
+  n = jnp.take(boundaries, index + 1) - jnp.take(boundaries, index)
+  a = m / jnp.clip(n, 1)
+  interpolated_factor = (
+      a * (step - jnp.take(boundaries, index)) + jnp.take(factors, index))
+  return interpolated_factor
 
 
 def linear_warmup_scheduler(step, warmup_steps, alpha=0.):
@@ -115,18 +114,6 @@ def linear_warmup_scheduler(step, warmup_steps, alpha=0.):
     return 1.0
 
 
-def rsqrt_decay_scheduler(step):
-  """Gives a scaling factor based on scheduling with a rsqrt decay.
-
-  Args:
-    step: int; Current step.
-
-  Returns:
-    Scaling factor applied to the learning rate on the given step.
-  """
-  return 1. / jnp.sqrt(step)
-
-
 def decay_every_scheduler(step, steps_per_decay, decay_factor):
   """Gives a scaling factor based on scheduling with a decay every n-steps.
 
@@ -139,6 +126,24 @@ def decay_every_scheduler(step, steps_per_decay, decay_factor):
     Scaling factor applied to the learning rate on the given step.
   """
   return decay_factor**(step // steps_per_decay)
+
+
+def exponential_decay_scheduler(step, decay_steps, decay_rate, staircase=False):
+  """Gives a scaling factor based on scheduling with an exponential decay.
+
+  Args:
+    step: int; Current step.
+    decay_steps: int; Number of steps to decay over.
+    decay_rate: float; Rate of exponential decay.
+    staircase: bool; If True, use integer division in scale-computation.
+
+  Returns:
+    Scaling factor applied to the learning rate on the given step.
+  """
+  progress = step / float(decay_steps)
+  if staircase:
+    progress = jnp.floor(progress)
+  return jnp.power(decay_rate, progress)
 
 
 def cosine_decay_scheduler(step, steps_per_cycle, t_mul=1, m_mul=1., alpha=0.):
@@ -154,6 +159,8 @@ def cosine_decay_scheduler(step, steps_per_cycle, t_mul=1, m_mul=1., alpha=0.):
   Returns:
     Scaling factor applied to the learning rate on the given step.
   """
+  if steps_per_cycle <= 0:
+    raise ValueError(f'steps_per_cycle must be > 0. Got {steps_per_cycle}.')
   progress = step / float(steps_per_cycle)
   if t_mul == 1.0:
     i_restart = jnp.floor(progress)
@@ -170,7 +177,7 @@ def cosine_decay_scheduler(step, steps_per_cycle, t_mul=1, m_mul=1., alpha=0.):
 
 
 def compound_lr_scheduler(config):
-  """Creates a learning rate scheduler by comnining multiple factors.
+  """Creates a learning rate scheduler by combining multiple factors.
 
   Interprets factors in the factors string which can consist of:
   * constant: interpreted as the constant value,
@@ -220,18 +227,23 @@ def compound_lr_scheduler(config):
         ratio *= linear_warmup_scheduler(step, warmup_steps, warmup_alpha)
 
       elif name == 'rsqrt_decay':
-        adjusted_step = jnp.maximum(step, config.get('warmup_steps', 0.))
-        ratio *= rsqrt_decay_scheduler(adjusted_step)
-
-      elif name == 'rsqrt_normalized_decay':
         warmup_steps = config.get('warmup_steps', 0.)
-        adjusted_step = jnp.maximum(step, warmup_steps)
-        ratio *= jnp.sqrt(warmup_steps) * rsqrt_decay_scheduler(adjusted_step)
+        timescale = config.get('timescale', 10_000)
+        shift = timescale - warmup_steps
+        ratio *= jnp.where(warmup_steps < step,
+                           jnp.sqrt(timescale) / jnp.sqrt(step + shift), 1.)
 
       elif name == 'decay_every':
         steps_per_decay = config['steps_per_decay']
         decay_factor = config['decay_factor']
         ratio *= decay_every_scheduler(step, steps_per_decay, decay_factor)
+
+      elif name == 'exponential_decay':
+        decay_steps = config['decay_steps']
+        decay_rate = config['decay_rate']
+        staircase = config.get('staircase', False)
+        ratio *= exponential_decay_scheduler(
+            step, decay_steps, decay_rate, staircase=staircase)
 
       elif name == 'cosine_decay':
         steps_per_cycle = config['steps_per_cycle']
@@ -243,15 +255,17 @@ def compound_lr_scheduler(config):
             0.0, (step - (warmup_steps + config.get('start_decay_step', 0.))))
         total_steps = config.get('total_steps', steps_per_cycle)
 
-        # we make the cos equal and subtract warmup steps for each cycle.
+        # We make the cos equal and subtract warmup steps for each cycle. If
+        # there are fewer steps than warmup steps, cosine can be skipped.
         steps_per_cycle = steps_per_cycle - int(
             warmup_steps / (total_steps / steps_per_cycle))
-        ratio *= cosine_decay_scheduler(
-            adjusted_step,
-            steps_per_cycle,
-            t_mul=t_mul,
-            m_mul=m_mul,
-            alpha=alpha)
+        if steps_per_cycle > 0:
+          ratio *= cosine_decay_scheduler(
+              adjusted_step,
+              steps_per_cycle,
+              t_mul=t_mul,
+              m_mul=m_mul,
+              alpha=alpha)
       elif name == 'linear_decay':
         warmup_steps = config.get('warmup_steps', 0.)
         total_steps = config.get('total_steps')
@@ -264,8 +278,14 @@ def compound_lr_scheduler(config):
         ratio *= jnp.maximum(1.0 - progress, 0.0)
         ratio += config.get('end_learning_rate', 0.)
 
+      elif name == 'linear_cooldown':
+        adjusted_step = jnp.maximum(step, config.get('warmup_steps', 0.))
+        ratio *= jnp.minimum(1., (config.total_steps - adjusted_step) /
+                             config.cooldown_steps)
+
       else:
         raise ValueError('Unknown factor %s.' % name)
+
     return jnp.asarray(ratio, dtype=jnp.float32)
 
   return lr_fn
@@ -276,16 +296,34 @@ lr_fn_dict = {
 }
 
 
-def get_learning_rate_fn(config):
+def get_learning_rate_fn(config: ml_collections.ConfigDict):
   """Looks up for the learning rate scheduler and return lr_fn.
 
   Args:
-    config: Configurations of the learning rate function.
+    config: ConfigDict that has configuration ofthe learning rate function.
 
   Returns:
-    A function learning_rate(step): float -> {'learning_rate': float}, the
-    step-dependent lr.
+    An learning rate or a function learning_rate(step):  float ->
+    {'learning_rate': float}, the step-dependent lr.
 
   """
-  return lr_fn_dict[config.lr_configs['learning_rate_schedule']](
-      config.lr_configs)
+  if 'base_learning_rate' not in config.lr_configs:
+    raise ValueError(
+        '`base_learning_rate` has to be defined in the lr_config.')
+  if not config.lr_configs.base_learning_rate:
+    # raise ValueError(  # raised for {0, False, None, [], (), {}}
+    #   f'`base_learning_rate = {config.lr_configs.base_learning_rate}` is not '
+    #   'allowed for training parameters. If your intention was to freeze '
+    #   'parameters, use Scenic optax and `config.lr_configs = None` instead.')
+    pass
+    # Circumvent failing of config.lr_configs.base_learning_rate in {0, False,
+    # None, [], (), {}} here as a short-term solution. This case is for now
+    # handled in optax.make to handle edge cases.
+  if 'learning_rate_schedule' in config.lr_configs:
+    # A function that given the current step, returns the LR.
+    return lr_fn_dict[config.lr_configs['learning_rate_schedule']](
+        config.lr_configs)
+  else:
+    # LR as a scalar value.
+    lr = jnp.asarray(config.lr_configs.base_learning_rate, dtype=jnp.float32)
+    return lambda step: lr
